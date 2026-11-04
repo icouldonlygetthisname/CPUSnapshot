@@ -1,0 +1,7 @@
+## Interface: 120100, 120105
+## Title: CPU Snapshot
+## Notes: /cpustart then /cpustop to see which addon burned the most CPU in between.
+## Author: icouldonlygetthisname
+## Version: 1.0
+
+CPUSnapshot.lua
