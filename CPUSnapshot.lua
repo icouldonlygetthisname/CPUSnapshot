@@ -73,6 +73,91 @@ SlashCmdList["CPUSNAPNOW"] = function(msg)
 	end
 end
 
+-- /cpuwatch [seconds]: sample every addon's recent average CPU for a while
+-- (e.g. while hovering bag items) and rank them by their share of the
+-- application's frame time. A share is unit-free, so it doesn't depend on
+-- whether this client reports metrics in ms or in ticks.
+local watching = false
+SLASH_CPUSNAPWATCH1 = "/cpuwatch"
+SlashCmdList["CPUSNAPWATCH"] = function(msg)
+	if watching then
+		print("|cffff5555CPUSnapshot:|r already watching.")
+		return
+	end
+	if not C_AddOnProfiler.IsEnabled() then
+		print("|cffff5555CPUSnapshot:|r C_AddOnProfiler.IsEnabled() is false -- no profiling data available.")
+		return
+	end
+	local seconds = tonumber(msg) or 15
+	local interval = 0.25
+	local samples = math.max(1, math.floor(seconds / interval))
+
+	local names = {}
+	for i = 1, C_AddOns.GetNumAddOns() do
+		local name = GetAddOnName(i)
+		if name and C_AddOns.IsAddOnLoaded(i) and name ~= "CPUSnapshot" then
+			names[#names + 1] = name
+		end
+	end
+
+	local sum, peak, appSum, taken = {}, {}, 0, 0
+	-- Real frame rate over the window, independent of how the profiler attributes blame.
+	local fpsSum, fpsMin, fpsSamples = 0, math.huge, 0
+	-- Per-frame times: GetFramerate() is smoothed and hides short hitches.
+	local frames, slowFrames, worstFrame = 0, 0, 0
+	local frameWatcher = CreateFrame("Frame")
+	frameWatcher:SetScript("OnUpdate", function(_, elapsed)
+		frames = frames + 1
+		if elapsed > 0.025 then slowFrames = slowFrames + 1 end
+		if elapsed > worstFrame then worstFrame = elapsed end
+	end)
+	watching = true
+	print(string.format("|cff55ff55CPUSnapshot:|r watching %d addons for %ds -- do the laggy thing now.", #names, seconds))
+	C_Timer.NewTicker(interval, function()
+		local fps = GetFramerate()
+		fpsSum, fpsSamples = fpsSum + fps, fpsSamples + 1
+		if fps < fpsMin then fpsMin = fps end
+
+		local app = C_AddOnProfiler.GetApplicationMetric(METRIC_RECENT)
+		if app and app > 0 then
+			appSum = appSum + app
+			taken = taken + 1
+			for _, name in ipairs(names) do
+				local ok, v = pcall(C_AddOnProfiler.GetAddOnMetric, name, METRIC_RECENT)
+				if ok and type(v) == "number" then
+					local share = v / app
+					sum[name] = (sum[name] or 0) + share
+					if share > (peak[name] or 0) then peak[name] = share end
+				end
+			end
+		end
+		samples = samples - 1
+		if samples > 0 then return end
+
+		watching = false
+		local overall = C_AddOnProfiler.GetOverallMetric(METRIC_RECENT)
+		local rows = {}
+		for name, s in pairs(sum) do
+			local avg = s / math.max(1, taken)
+			if avg >= 0.001 or (peak[name] or 0) >= 0.005 then
+				rows[#rows + 1] = { name = name, avg = avg, peak = peak[name] or 0 }
+			end
+		end
+		table.sort(rows, function(x, y) return x.avg > y.avg end)
+		local appNow = C_AddOnProfiler.GetApplicationMetric(METRIC_RECENT)
+		print(string.format("|cff55ff55CPUSnapshot watch:|r %d samples. All addons now = %.1f%% of frame time. Top %d by average share:",
+			taken, (appNow > 0 and overall / appNow or 0) * 100, math.min(15, #rows)))
+		frameWatcher:SetScript("OnUpdate", nil)
+		print(string.format("  |cffffd200FPS:|r avg %.0f, lowest %.0f", fpsSum / math.max(1, fpsSamples), fpsMin))
+		print(string.format("  |cffffd200Hitches:|r %d of %d frames over 25ms, worst frame %.0fms",
+			slowFrames, frames, worstFrame * 1000))
+		for i = 1, math.min(15, #rows) do
+			local r = rows[i]
+			print(string.format("  %2d. %-28s avg=%5.1f%%  peak=%5.1f%%", i, r.name, r.avg * 100, r.peak * 100))
+		end
+	end, samples)
+end
+
 SLASH_CPUSNAPSTART1 = "/cpustart"
 SlashCmdList["CPUSNAPSTART"] = function()
 	snapshot = TakeSnapshot()
@@ -118,4 +203,112 @@ SlashCmdList["CPUSNAPSTOP"] = function(msg)
 	end
 
 	snapshot = nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Hitch recorder: always on. Every frame slower than HITCH_MS is logged to
+-- CPUSnapshotDB.hitches (SavedVariables, written on /reload or logout) with
+-- the addons that were busiest in that frame (LastTime metric) and what the
+-- player was doing (tooltip item, bags open, zone, combat, nameplates).
+-- /cpurec        -- print the last 10 hitches
+-- /cpurec clear  -- empty the log
+-- /cpurec off|on -- pause / resume recording
+-- ---------------------------------------------------------------------------
+local HITCH_MS = 50
+local MAX_HITCHES = 500
+local METRIC_LAST = Enum.AddOnProfilerMetric.LastTime
+
+local loadTime = GetTime()
+local recording = true
+
+local function Plain(v)
+	if issecretvalue and issecretvalue(v) then return nil end
+	return v
+end
+
+local function TooltipContext()
+	if not GameTooltip:IsShown() then return nil end
+	local ctx = {}
+	local ok, owner = pcall(GameTooltip.GetOwner, GameTooltip)
+	if ok and owner and owner.GetDebugName then
+		local okName, name = pcall(owner.GetDebugName, owner)
+		ctx.owner = okName and Plain(name) or nil
+	end
+	local okItem, _, link = pcall(GameTooltip.GetItem, GameTooltip)
+	if okItem then ctx.item = Plain(link) end
+	return ctx
+end
+
+-- Baganator names its bag frames after the active skin ("blizzard", "dark", ...).
+local BAG_FRAMES = { "ContainerFrameCombinedBags", "ContainerFrame1" }
+for _, skin in ipairs({ "blizzard", "dark", "elvui", "gw2", "ndui", "" }) do
+	BAG_FRAMES[#BAG_FRAMES + 1] = "Baganator_SingleViewBackpackViewFrame" .. skin
+	BAG_FRAMES[#BAG_FRAMES + 1] = "Baganator_CategoryViewBackpackViewFrame" .. skin
+end
+
+local function BagsOpen()
+	for _, name in ipairs(BAG_FRAMES) do
+		local f = _G[name]
+		if f and f.IsShown and f:IsShown() then return name end
+	end
+	return nil
+end
+
+local function RecordHitch(elapsed)
+	CPUSnapshotDB = CPUSnapshotDB or {}
+	CPUSnapshotDB.hitches = CPUSnapshotDB.hitches or {}
+	local log = CPUSnapshotDB.hitches
+
+	local entry = {
+		when = date("%Y-%m-%d %H:%M:%S"),
+		ms = math.floor(elapsed * 1000 + 0.5),
+		sinceLoad = math.floor(GetTime() - loadTime),
+		app = C_AddOnProfiler.GetApplicationMetric(METRIC_LAST),
+		addons = C_AddOnProfiler.GetOverallMetric(METRIC_LAST),
+		zone = GetRealZoneText(),
+		subzone = GetSubZoneText(),
+		combat = InCombatLockdown() or nil,
+		nameplates = C_NamePlate and C_NamePlate.GetNamePlates and #C_NamePlate.GetNamePlates() or nil,
+		bags = BagsOpen(),
+		tooltip = TooltipContext(),
+		top = {},
+	}
+	local ok, top = pcall(C_AddOnProfiler.GetTopKAddOnsForMetric, METRIC_LAST, 5)
+	if ok and type(top) == "table" then
+		for i, r in ipairs(top) do
+			entry.top[i] = { name = r.addOnName, value = r.metricValue }
+		end
+	end
+
+	log[#log + 1] = entry
+	while #log > MAX_HITCHES do table.remove(log, 1) end
+end
+
+local recorder = CreateFrame("Frame")
+recorder:SetScript("OnUpdate", function(_, elapsed)
+	if recording and elapsed * 1000 >= HITCH_MS and C_AddOnProfiler.IsEnabled() then
+		RecordHitch(elapsed)
+	end
+end)
+
+SLASH_CPUSNAPREC1 = "/cpurec"
+SlashCmdList["CPUSNAPREC"] = function(msg)
+	msg = (msg or ""):lower()
+	if msg == "clear" then
+		if CPUSnapshotDB then CPUSnapshotDB.hitches = {} end
+		print("|cff55ff55CPUSnapshot:|r hitch log cleared.")
+		return
+	elseif msg == "off" or msg == "on" then
+		recording = msg == "on"
+		print("|cff55ff55CPUSnapshot:|r hitch recording " .. msg .. ".")
+		return
+	end
+	local log = CPUSnapshotDB and CPUSnapshotDB.hitches or {}
+	print(string.format("|cff55ff55CPUSnapshot:|r %d hitches (>%dms) logged%s. Last 10:", #log, HITCH_MS, recording and "" or " (paused)"))
+	for i = math.max(1, #log - 9), #log do
+		local e = log[i]
+		local first = e.top[1]
+		print(string.format("  %s  %dms  top=%s  bags=%s  tip=%s", e.when:sub(12), e.ms,
+			first and first.name or "-", e.bags and "y" or "n", e.tooltip and (e.tooltip.item or e.tooltip.owner or "?") or "-"))
+	end
 end
