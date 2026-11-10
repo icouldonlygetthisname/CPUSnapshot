@@ -158,6 +158,99 @@ SlashCmdList["CPUSNAPWATCH"] = function(msg)
 	end, samples)
 end
 
+-- /cpuace [seconds]: time every AceEvent-3.0 event and message handler, per addon.
+-- Shared libraries run from the copy that loaded first, and C_AddOnProfiler charges
+-- that addon for every other addon's handlers dispatched through it. This wraps
+-- each registered handler with a timer for the sample period, then restores it.
+-- Handlers registered during the sample aren't timed.
+local function AceOwnerName(owner)
+	if type(owner) == "string" then return owner end
+	if type(owner) == "table" then
+		local name = rawget(owner, "name") or rawget(owner, "moduleName")
+		if type(name) == "string" then return name end
+	end
+	return tostring(owner)
+end
+
+local aceWatching = false
+SLASH_CPUSNAPACE1 = "/cpuace"
+SlashCmdList["CPUSNAPACE"] = function(msg)
+	if aceWatching then
+		print("|cffff5555CPUSnapshot:|r already timing AceEvent handlers.")
+		return
+	end
+	local AceEvent = LibStub and LibStub("AceEvent-3.0", true)
+	if not AceEvent then
+		print("|cffff5555CPUSnapshot:|r no AceEvent-3.0 loaded.")
+		return
+	end
+	local seconds = tonumber(msg) or 15
+
+	local byOwner, byOwnerEvent, calls = {}, {}, {}
+	local wrapped = {} -- { handlers, owner, original, wrapper }
+	for kind, registry in pairs({ event = AceEvent.events, message = AceEvent.messages }) do
+		local events = registry and registry.events
+		if events then
+			for eventName, handlers in pairs(events) do
+				for owner, original in pairs(handlers) do
+					if type(original) == "function" then
+						local who = AceOwnerName(owner)
+						local key = who .. "  " .. eventName .. (kind == "message" and " (msg)" or "")
+						local function wrapper(...)
+							local start = debugprofilestop()
+							original(...)
+							local ms = debugprofilestop() - start
+							byOwner[who] = (byOwner[who] or 0) + ms
+							byOwnerEvent[key] = (byOwnerEvent[key] or 0) + ms
+							calls[key] = (calls[key] or 0) + 1
+						end
+						handlers[owner] = wrapper
+						wrapped[#wrapped + 1] = { handlers, owner, original, wrapper }
+					end
+				end
+			end
+		end
+	end
+
+	local frames = 0
+	local counter = CreateFrame("Frame")
+	counter:SetScript("OnUpdate", function() frames = frames + 1 end)
+	aceWatching = true
+	print(string.format("|cff55ff55CPUSnapshot:|r timing %d AceEvent handlers for %ds.", #wrapped, seconds))
+
+	C_Timer.After(seconds, function()
+		counter:SetScript("OnUpdate", nil)
+		-- Restore, unless the owner re-registered in the meantime.
+		for _, w in ipairs(wrapped) do
+			local handlers, owner, original, wrapper = w[1], w[2], w[3], w[4]
+			if handlers[owner] == wrapper then handlers[owner] = original end
+		end
+		aceWatching = false
+
+		local owners, total = {}, 0
+		for who, ms in pairs(byOwner) do
+			owners[#owners + 1] = { who = who, ms = ms }
+			total = total + ms
+		end
+		table.sort(owners, function(x, y) return x.ms > y.ms end)
+		local keys = {}
+		for key, ms in pairs(byOwnerEvent) do keys[#keys + 1] = { key = key, ms = ms } end
+		table.sort(keys, function(x, y) return x.ms > y.ms end)
+
+		print(string.format("|cff55ff55CPUSnapshot ace:|r %.0fms in AceEvent handlers over %d frames (%.2fms per frame). By addon:",
+			total, frames, frames > 0 and total / frames or 0))
+		for i = 1, math.min(8, #owners) do
+			local o = owners[i]
+			print(string.format("  %2d. %-28s %7.0fms  %.2fms/frame", i, o.who, o.ms, frames > 0 and o.ms / frames or 0))
+		end
+		print("  Top handlers:")
+		for i = 1, math.min(8, #keys) do
+			local k = keys[i]
+			print(string.format("  %2d. %-40s %6.0fms  %d calls", i, k.key, k.ms, calls[k.key] or 0))
+		end
+	end)
+end
+
 SLASH_CPUSNAPSTART1 = "/cpustart"
 SlashCmdList["CPUSNAPSTART"] = function()
 	snapshot = TakeSnapshot()

@@ -12,6 +12,7 @@ It uses `C_AddOnProfiler`. The old `GetAddOnCPUUsage`/`UpdateAddOnCPUUsage` glob
 | `/cpustop [N]` | Compare against the baseline and list the top N addons (default 15). Sorted by new 500ms+ hits, then 100ms+ hits, then recent average CPU time. |
 | `/cpunow [N]` | List the top N addons by current metrics, with no baseline needed. |
 | `/cpuwatch [seconds]` | Sample for a while (default 15s) and rank addons by their share of frame time. Also prints the real FPS and the number of frames over 25ms. |
+| `/cpuace [seconds]` | Time every AceEvent-3.0 event and message handler for a while (default 15s), per addon. Prints ms in total and per frame, and the 8 most expensive handlers. |
 | `/cpurec` | Print the last 10 hitches from the hitch recorder. `/cpurec clear` empties the log; `/cpurec off` / `on` pauses and resumes it. |
 
 Typical use: `/cpustart`, do the thing that stutters (open a window, enter combat, zone in), then `/cpustop`. Or run `/cpuwatch` and do the laggy thing until it prints.
@@ -22,6 +23,10 @@ Typical use: `/cpustart`, do the thing that stutters (open a window, enter comba
 - `FPS: avg, lowest` comes from `GetFramerate()`, which is smoothed.
 - `Hitches: N of M frames over 25ms, worst frame Xms` comes from per-frame `OnUpdate` times. This is the best measure of the stutter you actually feel.
 - The profiler charges time to the addon that *started* a code path. Shared libraries and hooks can make the blame land on the wrong addon, so confirm a suspect by turning it off and comparing the Hitches line.
+
+## /cpuace
+
+Every Ace3 addon shares the one copy of AceEvent-3.0 that loaded first, and the profiler charges that addon for every other addon's event handlers. A big share on an addon that ships Ace3 (e.g. GatherMate2) may belong to another addon. If disabling it moves the share to the next Ace3 addon in load order, run `/cpuace`: it wraps each registered handler with a timer, so the time lands on the addon whose handler it is. Handlers are restored afterwards; ones registered during the sample aren't timed. Example: GatherMate2 showed ~17% in `/cpuwatch`, and `/cpuace` put it on Routes (1.06ms per frame from a minimap zoom loop on WoW Forever).
 
 ## Hitch recorder
 
