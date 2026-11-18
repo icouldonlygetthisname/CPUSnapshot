@@ -14,6 +14,7 @@ It uses `C_AddOnProfiler`. The old `GetAddOnCPUUsage`/`UpdateAddOnCPUUsage` glob
 | `/cpuwatch [seconds]` | Sample for a while (default 15s) and rank addons by their share of frame time. Also prints the real FPS and the number of frames over 25ms. |
 | `/cpuace [seconds]` | Time every AceEvent-3.0 event and message handler for a while (default 15s), per addon. Prints ms in total and per frame, and the 8 most expensive handlers. |
 | `/cpurec` | Print the last 10 hitches from the hitch recorder. `/cpurec clear` empties the log; `/cpurec off` / `on` pauses and resumes it. |
+| `/cpuload [addon]` | Arm the load tracer for one addon (default `!WilduTools`), then `/reload`. For 20s after each loading screen in that session it logs the frames where that addon used 5ms or more. `/cpuload show` reprints the saved runs; `/cpuload off` disarms. |
 
 Typical use: `/cpustart`, do the thing that stutters (open a window, enter combat, zone in), then `/cpustop`. Or run `/cpuwatch` and do the laggy thing until it prints.
 
@@ -27,6 +28,16 @@ Typical use: `/cpustart`, do the thing that stutters (open a window, enter comba
 ## /cpuace
 
 Every Ace3 addon shares the one copy of AceEvent-3.0 that loaded first, and the profiler charges that addon for every other addon's event handlers. A big share on an addon that ships Ace3 (e.g. GatherMate2) may belong to another addon. If disabling it moves the share to the next Ace3 addon in load order, run `/cpuace`: it wraps each registered handler with a timer, so the time lands on the addon whose handler it is. Handlers are restored afterwards; ones registered during the sample aren't timed. Example: GatherMate2 showed ~17% in `/cpuwatch`, and `/cpuace` put it on Routes (1.06ms per frame from a minimap zoom loop on WoW Forever).
+
+## /cpuload
+
+Finds which part of an addon's after-login work causes a freeze. Arm it with `/cpuload [addon]` (use the folder name, e.g. `!WilduTools`), then `/reload`. Arming lasts for that one session. Every loading screen in it opens a 20-second window. Each frame where the addon's profiler `LastTime` is 5ms or more is printed at the end of the window and saved to `CPUSnapshotDB.loadRuns` (last 5 runs), with:
+
+- seconds since the loading screen, the addon's ms and the whole frame's ms;
+- the addon's `C_Timer` callbacks due in that frame, with their delay and the file:line that scheduled them;
+- the events that fired in that frame and the one before.
+
+"No timer of this addon was due" means the work came from an event handler or `OnUpdate`; the event list then says which. `C_Timer.After`, `NewTimer` and `NewTicker` are post-hooked with `hooksecurefunc` only in an armed session, so nothing is replaced and Blizzard code isn't tainted. Timers scheduled before CPUSnapshot's own `ADDON_LOADED` (addons that load earlier, at their own load) aren't seen.
 
 ## Hitch recorder
 

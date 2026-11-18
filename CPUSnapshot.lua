@@ -384,6 +384,194 @@ recorder:SetScript("OnUpdate", function(_, elapsed)
 	end
 end)
 
+-- ---------------------------------------------------------------------------
+-- Load tracer: what one addon does in the seconds after a loading screen.
+-- /cpuload [addon]  -- arm for the next session (default !WilduTools), then /reload
+-- /cpuload show     -- print the saved runs again
+-- /cpuload off      -- disarm
+-- While armed, every loading screen in that session opens a LOAD_WINDOW-second
+-- window. Each frame where the addon used LOAD_HEAVY_MS or more is logged with
+-- the addon's C_Timer callbacks due in that frame (where they were scheduled
+-- from, and with what delay) and the events that fired. C_Timer is only
+-- post-hooked (hooksecurefunc), so nothing is replaced and nothing is tainted.
+-- The hooks only exist in an armed session; arming lasts one /reload.
+-- ---------------------------------------------------------------------------
+local LOAD_WINDOW = 20
+local LOAD_HEAVY_MS = 5
+local MAX_LOAD_RUNS = 5
+
+local loadTarget -- addon name while this session is armed
+local loadTimers = {} -- { due, delay, where, ticker }
+local loadRun -- run currently recording, or nil
+local loadEvents, loadPrevEvents = {}, {}
+local loadPrevTime, loadPrevPrevTime = 0, 0
+
+local function ShortStack(stack)
+	local lines = {}
+	for line in stack:gmatch("[^\n]+") do
+		if not line:find("CPUSnapshot", 1, true) and not line:find("^%[C%]") then
+			line = line:gsub("%[string \"@?", ""):gsub("\"%]", ""):gsub("Interface/AddOns/", ""):gsub("[%[%]]", "")
+			lines[#lines + 1] = line:gsub(": in function", " in")
+			if #lines == 2 then break end
+		end
+	end
+	return table.concat(lines, "  <  ")
+end
+
+local function OnTimerScheduled(ticker)
+	return function(delay)
+		if not loadTarget or type(delay) ~= "number" then return end
+		local stack = debugstack(2, 8, 0) or ""
+		if not stack:find("AddOns/" .. loadTarget .. "/", 1, true) then return end
+		local now = GetTime()
+		-- Drop one-shot timers that fired long ago so the list stays short; tickers keep firing.
+		for i = #loadTimers, 1, -1 do
+			if not loadTimers[i].ticker and loadTimers[i].due < now - 1 then table.remove(loadTimers, i) end
+		end
+		loadTimers[#loadTimers + 1] = { due = now + delay, delay = delay, where = ShortStack(stack), ticker = ticker }
+	end
+end
+
+local function TopEvents(counts, n)
+	local list = {}
+	for event, count in pairs(counts) do list[#list + 1] = { event = event, count = count } end
+	table.sort(list, function(a, b) return a.count > b.count end)
+	local out = {}
+	for i = 1, math.min(n, #list) do
+		out[i] = list[i].count > 1 and (list[i].event .. " x" .. list[i].count) or list[i].event
+	end
+	return out
+end
+
+local function PrintLoadRun(run)
+	local total = 0
+	for _, f in ipairs(run.frames) do total = total + f.ms end
+	print(string.format("|cff55ff55CPUSnapshot load:|r %s, %s after loading screen at %s: %d frames of %dms+, %.0fms in all.",
+		run.addon, LOAD_WINDOW .. "s", run.when, #run.frames, LOAD_HEAVY_MS, total))
+	local sorted = {}
+	for i, f in ipairs(run.frames) do sorted[i] = f end
+	table.sort(sorted, function(a, b) return a.ms > b.ms end)
+	for i = 1, math.min(5, #sorted) do
+		local f = sorted[i]
+		print(string.format("  +%.2fs  %dms (frame %dms)", f.t, f.ms, f.frameMs))
+		if #f.timers == 0 then
+			print("     no timer of this addon was due: an event handler or OnUpdate")
+		end
+		for _, timer in ipairs(f.timers) do
+			print(string.format("     timer %s%.1fs: %s", timer.ticker and "ticker " or "", timer.delay, timer.where))
+		end
+		if #f.events > 0 then
+			print("     events: " .. table.concat(f.events, ", "))
+		end
+	end
+end
+
+local function FinishLoadRun(watcher)
+	local run = loadRun
+	loadRun = nil
+	watcher:UnregisterAllEvents()
+	watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+	CPUSnapshotDB.loadRuns = CPUSnapshotDB.loadRuns or {}
+	local runs = CPUSnapshotDB.loadRuns
+	runs[#runs + 1] = run
+	while #runs > MAX_LOAD_RUNS do table.remove(runs, 1) end
+	PrintLoadRun(run)
+end
+
+local function StartLoadTracer(target)
+	loadTarget = target
+	hooksecurefunc(C_Timer, "After", OnTimerScheduled(false))
+	hooksecurefunc(C_Timer, "NewTimer", OnTimerScheduled(false))
+	hooksecurefunc(C_Timer, "NewTicker", OnTimerScheduled(true))
+
+	local watcher = CreateFrame("Frame")
+	watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+	watcher:SetScript("OnEvent", function(self, event)
+		if event == "PLAYER_ENTERING_WORLD" and not loadRun then
+			loadRun = { addon = target, when = date("%H:%M:%S"), pew = GetTime(), frames = {} }
+			wipe(loadEvents)
+			wipe(loadPrevEvents)
+			-- Only during the window: the event names say which handlers ran in a heavy frame.
+			self:RegisterAllEvents()
+		end
+		if loadRun then loadEvents[event] = (loadEvents[event] or 0) + 1 end
+	end)
+	watcher:SetScript("OnUpdate", function(self)
+		local now = GetTime()
+		local run = loadRun
+		if run then
+			local ok, ms = pcall(C_AddOnProfiler.GetAddOnMetric, target, METRIC_LAST)
+			if ok and type(ms) == "number" and ms >= LOAD_HEAVY_MS then
+				-- LastTime may describe this frame or the one before, so take both frames' timers and events.
+				local timers = {}
+				for _, timer in ipairs(loadTimers) do
+					local fired = timer.due
+					-- A ticker's latest run at or before now. Cancelled tickers still match; the
+					-- hook can't see Cancel(), so treat a ticker line as a lead, not proof.
+					if timer.ticker and timer.delay > 0 and fired <= now + 0.01 then
+						fired = fired + math.floor((now + 0.01 - fired) / timer.delay) * timer.delay
+					end
+					-- Ticker runs land on frame boundaries and drift late, so allow some slack before.
+					local slack = timer.ticker and 0.05 or 0.01
+					if fired > loadPrevPrevTime - slack and fired <= now + 0.01 then
+						timers[#timers + 1] = { delay = timer.delay, where = timer.where, ticker = timer.ticker or nil }
+					end
+				end
+				local counts = {}
+				for e, c in pairs(loadPrevEvents) do counts[e] = c end
+				for e, c in pairs(loadEvents) do counts[e] = (counts[e] or 0) + c end
+				run.frames[#run.frames + 1] = {
+					t = now - run.pew,
+					ms = math.floor(ms + 0.5),
+					frameMs = math.floor((now - loadPrevTime) * 1000 + 0.5),
+					timers = timers,
+					events = TopEvents(counts, 6),
+				}
+			end
+			loadPrevEvents, loadEvents = loadEvents, loadPrevEvents
+			wipe(loadEvents)
+			if now - run.pew > LOAD_WINDOW then FinishLoadRun(self) end
+		end
+		loadPrevPrevTime, loadPrevTime = loadPrevTime, now
+	end)
+	print(string.format("|cff55ff55CPUSnapshot:|r tracing %s for %ds after each loading screen this session.", target, LOAD_WINDOW))
+end
+
+local loader = CreateFrame("Frame")
+loader:RegisterEvent("ADDON_LOADED")
+loader:SetScript("OnEvent", function(self, _, name)
+	if name ~= "CPUSnapshot" then return end
+	self:UnregisterEvent("ADDON_LOADED")
+	local target = CPUSnapshotDB and CPUSnapshotDB.armLoad
+	if target then
+		CPUSnapshotDB.armLoad = nil -- one session only
+		StartLoadTracer(target)
+	end
+end)
+
+SLASH_CPUSNAPLOAD1 = "/cpuload"
+SlashCmdList["CPUSNAPLOAD"] = function(msg)
+	msg = strtrim(msg or "")
+	CPUSnapshotDB = CPUSnapshotDB or {}
+	if msg:lower() == "off" then
+		CPUSnapshotDB.armLoad = nil
+		print("|cff55ff55CPUSnapshot:|r load tracer disarmed.")
+		return
+	elseif msg:lower() == "show" then
+		local runs = CPUSnapshotDB.loadRuns or {}
+		if #runs == 0 then print("|cff55ff55CPUSnapshot:|r no load runs saved.") end
+		for _, run in ipairs(runs) do PrintLoadRun(run) end
+		return
+	end
+	local target = msg ~= "" and msg or "!WilduTools"
+	if not C_AddOns.IsAddOnLoaded(target) then
+		print("|cffff5555CPUSnapshot:|r no loaded addon called " .. target .. " (use the folder name).")
+		return
+	end
+	CPUSnapshotDB.armLoad = target
+	print("|cff55ff55CPUSnapshot:|r load tracer armed for " .. target .. ". /reload now; it reports " .. LOAD_WINDOW .. "s after each loading screen.")
+end
+
 SLASH_CPUSNAPREC1 = "/cpurec"
 SlashCmdList["CPUSNAPREC"] = function(msg)
 	msg = (msg or ""):lower()

@@ -2,7 +2,7 @@
 ## Title: CPU Snapshot
 ## Notes: /cpustart then /cpustop to see which addon burned the most CPU in between.
 ## Author: icouldonlygetthisname
-## Version: 1.1
+## Version: 1.2
 ## SavedVariables: CPUSnapshotDB
 
 CPUSnapshot.lua
