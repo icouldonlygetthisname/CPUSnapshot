@@ -73,6 +73,184 @@ SlashCmdList["CPUSNAPNOW"] = function(msg)
 	end
 end
 
+-- /cpuwatch [seconds]: sample every addon's recent average CPU for a while
+-- (e.g. while hovering bag items) and rank them by their share of the
+-- application's frame time. A share is unit-free, so it doesn't depend on
+-- whether this client reports metrics in ms or in ticks.
+local watching = false
+SLASH_CPUSNAPWATCH1 = "/cpuwatch"
+SlashCmdList["CPUSNAPWATCH"] = function(msg)
+	if watching then
+		print("|cffff5555CPUSnapshot:|r already watching.")
+		return
+	end
+	if not C_AddOnProfiler.IsEnabled() then
+		print("|cffff5555CPUSnapshot:|r C_AddOnProfiler.IsEnabled() is false -- no profiling data available.")
+		return
+	end
+	local seconds = tonumber(msg) or 15
+	local interval = 0.25
+	local samples = math.max(1, math.floor(seconds / interval))
+
+	local names = {}
+	for i = 1, C_AddOns.GetNumAddOns() do
+		local name = GetAddOnName(i)
+		if name and C_AddOns.IsAddOnLoaded(i) and name ~= "CPUSnapshot" then
+			names[#names + 1] = name
+		end
+	end
+
+	local sum, peak, appSum, taken = {}, {}, 0, 0
+	-- Real frame rate over the window, independent of how the profiler attributes blame.
+	local fpsSum, fpsMin, fpsSamples = 0, math.huge, 0
+	-- Per-frame times: GetFramerate() is smoothed and hides short hitches.
+	local frames, slowFrames, worstFrame = 0, 0, 0
+	local frameWatcher = CreateFrame("Frame")
+	frameWatcher:SetScript("OnUpdate", function(_, elapsed)
+		frames = frames + 1
+		if elapsed > 0.025 then slowFrames = slowFrames + 1 end
+		if elapsed > worstFrame then worstFrame = elapsed end
+	end)
+	watching = true
+	print(string.format("|cff55ff55CPUSnapshot:|r watching %d addons for %ds -- do the laggy thing now.", #names, seconds))
+	C_Timer.NewTicker(interval, function()
+		local fps = GetFramerate()
+		fpsSum, fpsSamples = fpsSum + fps, fpsSamples + 1
+		if fps < fpsMin then fpsMin = fps end
+
+		local app = C_AddOnProfiler.GetApplicationMetric(METRIC_RECENT)
+		if app and app > 0 then
+			appSum = appSum + app
+			taken = taken + 1
+			for _, name in ipairs(names) do
+				local ok, v = pcall(C_AddOnProfiler.GetAddOnMetric, name, METRIC_RECENT)
+				if ok and type(v) == "number" then
+					local share = v / app
+					sum[name] = (sum[name] or 0) + share
+					if share > (peak[name] or 0) then peak[name] = share end
+				end
+			end
+		end
+		samples = samples - 1
+		if samples > 0 then return end
+
+		watching = false
+		local overall = C_AddOnProfiler.GetOverallMetric(METRIC_RECENT)
+		local rows = {}
+		for name, s in pairs(sum) do
+			local avg = s / math.max(1, taken)
+			if avg >= 0.001 or (peak[name] or 0) >= 0.005 then
+				rows[#rows + 1] = { name = name, avg = avg, peak = peak[name] or 0 }
+			end
+		end
+		table.sort(rows, function(x, y) return x.avg > y.avg end)
+		local appNow = C_AddOnProfiler.GetApplicationMetric(METRIC_RECENT)
+		print(string.format("|cff55ff55CPUSnapshot watch:|r %d samples. All addons now = %.1f%% of frame time. Top %d by average share:",
+			taken, (appNow > 0 and overall / appNow or 0) * 100, math.min(15, #rows)))
+		frameWatcher:SetScript("OnUpdate", nil)
+		print(string.format("  |cffffd200FPS:|r avg %.0f, lowest %.0f", fpsSum / math.max(1, fpsSamples), fpsMin))
+		print(string.format("  |cffffd200Hitches:|r %d of %d frames over 25ms, worst frame %.0fms",
+			slowFrames, frames, worstFrame * 1000))
+		for i = 1, math.min(15, #rows) do
+			local r = rows[i]
+			print(string.format("  %2d. %-28s avg=%5.1f%%  peak=%5.1f%%", i, r.name, r.avg * 100, r.peak * 100))
+		end
+	end, samples)
+end
+
+-- /cpuace [seconds]: time every AceEvent-3.0 event and message handler, per addon.
+-- Shared libraries run from the copy that loaded first, and C_AddOnProfiler charges
+-- that addon for every other addon's handlers dispatched through it. This wraps
+-- each registered handler with a timer for the sample period, then restores it.
+-- Handlers registered during the sample aren't timed.
+local function AceOwnerName(owner)
+	if type(owner) == "string" then return owner end
+	if type(owner) == "table" then
+		local name = rawget(owner, "name") or rawget(owner, "moduleName")
+		if type(name) == "string" then return name end
+	end
+	return tostring(owner)
+end
+
+local aceWatching = false
+SLASH_CPUSNAPACE1 = "/cpuace"
+SlashCmdList["CPUSNAPACE"] = function(msg)
+	if aceWatching then
+		print("|cffff5555CPUSnapshot:|r already timing AceEvent handlers.")
+		return
+	end
+	local AceEvent = LibStub and LibStub("AceEvent-3.0", true)
+	if not AceEvent then
+		print("|cffff5555CPUSnapshot:|r no AceEvent-3.0 loaded.")
+		return
+	end
+	local seconds = tonumber(msg) or 15
+
+	local byOwner, byOwnerEvent, calls = {}, {}, {}
+	local wrapped = {} -- { handlers, owner, original, wrapper }
+	for kind, registry in pairs({ event = AceEvent.events, message = AceEvent.messages }) do
+		local events = registry and registry.events
+		if events then
+			for eventName, handlers in pairs(events) do
+				for owner, original in pairs(handlers) do
+					if type(original) == "function" then
+						local who = AceOwnerName(owner)
+						local key = who .. "  " .. eventName .. (kind == "message" and " (msg)" or "")
+						local function wrapper(...)
+							local start = debugprofilestop()
+							original(...)
+							local ms = debugprofilestop() - start
+							byOwner[who] = (byOwner[who] or 0) + ms
+							byOwnerEvent[key] = (byOwnerEvent[key] or 0) + ms
+							calls[key] = (calls[key] or 0) + 1
+						end
+						handlers[owner] = wrapper
+						wrapped[#wrapped + 1] = { handlers, owner, original, wrapper }
+					end
+				end
+			end
+		end
+	end
+
+	local frames = 0
+	local counter = CreateFrame("Frame")
+	counter:SetScript("OnUpdate", function() frames = frames + 1 end)
+	aceWatching = true
+	print(string.format("|cff55ff55CPUSnapshot:|r timing %d AceEvent handlers for %ds.", #wrapped, seconds))
+
+	C_Timer.After(seconds, function()
+		counter:SetScript("OnUpdate", nil)
+		-- Restore, unless the owner re-registered in the meantime.
+		for _, w in ipairs(wrapped) do
+			local handlers, owner, original, wrapper = w[1], w[2], w[3], w[4]
+			if handlers[owner] == wrapper then handlers[owner] = original end
+		end
+		aceWatching = false
+
+		local owners, total = {}, 0
+		for who, ms in pairs(byOwner) do
+			owners[#owners + 1] = { who = who, ms = ms }
+			total = total + ms
+		end
+		table.sort(owners, function(x, y) return x.ms > y.ms end)
+		local keys = {}
+		for key, ms in pairs(byOwnerEvent) do keys[#keys + 1] = { key = key, ms = ms } end
+		table.sort(keys, function(x, y) return x.ms > y.ms end)
+
+		print(string.format("|cff55ff55CPUSnapshot ace:|r %.0fms in AceEvent handlers over %d frames (%.2fms per frame). By addon:",
+			total, frames, frames > 0 and total / frames or 0))
+		for i = 1, math.min(8, #owners) do
+			local o = owners[i]
+			print(string.format("  %2d. %-28s %7.0fms  %.2fms/frame", i, o.who, o.ms, frames > 0 and o.ms / frames or 0))
+		end
+		print("  Top handlers:")
+		for i = 1, math.min(8, #keys) do
+			local k = keys[i]
+			print(string.format("  %2d. %-40s %6.0fms  %d calls", i, k.key, k.ms, calls[k.key] or 0))
+		end
+	end)
+end
+
 SLASH_CPUSNAPSTART1 = "/cpustart"
 SlashCmdList["CPUSNAPSTART"] = function()
 	snapshot = TakeSnapshot()
@@ -118,4 +296,300 @@ SlashCmdList["CPUSNAPSTOP"] = function(msg)
 	end
 
 	snapshot = nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Hitch recorder: always on. Every frame slower than HITCH_MS is logged to
+-- CPUSnapshotDB.hitches (SavedVariables, written on /reload or logout) with
+-- the addons that were busiest in that frame (LastTime metric) and what the
+-- player was doing (tooltip item, bags open, zone, combat, nameplates).
+-- /cpurec        -- print the last 10 hitches
+-- /cpurec clear  -- empty the log
+-- /cpurec off|on -- pause / resume recording
+-- ---------------------------------------------------------------------------
+local HITCH_MS = 50
+local MAX_HITCHES = 500
+local METRIC_LAST = Enum.AddOnProfilerMetric.LastTime
+
+local loadTime = GetTime()
+local recording = true
+
+local function Plain(v)
+	if issecretvalue and issecretvalue(v) then return nil end
+	return v
+end
+
+local function TooltipContext()
+	if not GameTooltip:IsShown() then return nil end
+	local ctx = {}
+	local ok, owner = pcall(GameTooltip.GetOwner, GameTooltip)
+	if ok and owner and owner.GetDebugName then
+		local okName, name = pcall(owner.GetDebugName, owner)
+		ctx.owner = okName and Plain(name) or nil
+	end
+	local okItem, _, link = pcall(GameTooltip.GetItem, GameTooltip)
+	if okItem then ctx.item = Plain(link) end
+	return ctx
+end
+
+-- Baganator names its bag frames after the active skin ("blizzard", "dark", ...).
+local BAG_FRAMES = { "ContainerFrameCombinedBags", "ContainerFrame1" }
+for _, skin in ipairs({ "blizzard", "dark", "elvui", "gw2", "ndui", "" }) do
+	BAG_FRAMES[#BAG_FRAMES + 1] = "Baganator_SingleViewBackpackViewFrame" .. skin
+	BAG_FRAMES[#BAG_FRAMES + 1] = "Baganator_CategoryViewBackpackViewFrame" .. skin
+end
+
+local function BagsOpen()
+	for _, name in ipairs(BAG_FRAMES) do
+		local f = _G[name]
+		if f and f.IsShown and f:IsShown() then return name end
+	end
+	return nil
+end
+
+local function RecordHitch(elapsed)
+	CPUSnapshotDB = CPUSnapshotDB or {}
+	CPUSnapshotDB.hitches = CPUSnapshotDB.hitches or {}
+	local log = CPUSnapshotDB.hitches
+
+	local entry = {
+		when = date("%Y-%m-%d %H:%M:%S"),
+		ms = math.floor(elapsed * 1000 + 0.5),
+		sinceLoad = math.floor(GetTime() - loadTime),
+		app = C_AddOnProfiler.GetApplicationMetric(METRIC_LAST),
+		addons = C_AddOnProfiler.GetOverallMetric(METRIC_LAST),
+		zone = GetRealZoneText(),
+		subzone = GetSubZoneText(),
+		combat = InCombatLockdown() or nil,
+		nameplates = C_NamePlate and C_NamePlate.GetNamePlates and #C_NamePlate.GetNamePlates() or nil,
+		bags = BagsOpen(),
+		tooltip = TooltipContext(),
+		top = {},
+	}
+	local ok, top = pcall(C_AddOnProfiler.GetTopKAddOnsForMetric, METRIC_LAST, 5)
+	if ok and type(top) == "table" then
+		for i, r in ipairs(top) do
+			entry.top[i] = { name = r.addOnName, value = r.metricValue }
+		end
+	end
+
+	log[#log + 1] = entry
+	while #log > MAX_HITCHES do table.remove(log, 1) end
+end
+
+local recorder = CreateFrame("Frame")
+recorder:SetScript("OnUpdate", function(_, elapsed)
+	if recording and elapsed * 1000 >= HITCH_MS and C_AddOnProfiler.IsEnabled() then
+		RecordHitch(elapsed)
+	end
+end)
+
+-- ---------------------------------------------------------------------------
+-- Load tracer: what one addon does in the seconds after a loading screen.
+-- /cpuload [addon]  -- arm for the next session (default !WilduTools), then /reload
+-- /cpuload show     -- print the saved runs again
+-- /cpuload off      -- disarm
+-- While armed, every loading screen in that session opens a LOAD_WINDOW-second
+-- window. Each frame where the addon used LOAD_HEAVY_MS or more is logged with
+-- the addon's C_Timer callbacks due in that frame (where they were scheduled
+-- from, and with what delay) and the events that fired. C_Timer is only
+-- post-hooked (hooksecurefunc), so nothing is replaced and nothing is tainted.
+-- The hooks only exist in an armed session; arming lasts one /reload.
+-- ---------------------------------------------------------------------------
+local LOAD_WINDOW = 20
+local LOAD_HEAVY_MS = 5
+local MAX_LOAD_RUNS = 5
+
+local loadTarget -- addon name while this session is armed
+local loadTimers = {} -- { due, delay, where, ticker }
+local loadRun -- run currently recording, or nil
+local loadEvents, loadPrevEvents = {}, {}
+local loadPrevTime, loadPrevPrevTime = 0, 0
+
+local function ShortStack(stack)
+	local lines = {}
+	for line in stack:gmatch("[^\n]+") do
+		if not line:find("CPUSnapshot", 1, true) and not line:find("^%[C%]") then
+			line = line:gsub("%[string \"@?", ""):gsub("\"%]", ""):gsub("Interface/AddOns/", ""):gsub("[%[%]]", "")
+			lines[#lines + 1] = line:gsub(": in function", " in")
+			if #lines == 2 then break end
+		end
+	end
+	return table.concat(lines, "  <  ")
+end
+
+local function OnTimerScheduled(ticker)
+	return function(delay)
+		if not loadTarget or type(delay) ~= "number" then return end
+		local stack = debugstack(2, 8, 0) or ""
+		if not stack:find("AddOns/" .. loadTarget .. "/", 1, true) then return end
+		local now = GetTime()
+		-- Drop one-shot timers that fired long ago so the list stays short; tickers keep firing.
+		for i = #loadTimers, 1, -1 do
+			if not loadTimers[i].ticker and loadTimers[i].due < now - 1 then table.remove(loadTimers, i) end
+		end
+		loadTimers[#loadTimers + 1] = { due = now + delay, delay = delay, where = ShortStack(stack), ticker = ticker }
+	end
+end
+
+local function TopEvents(counts, n)
+	local list = {}
+	for event, count in pairs(counts) do list[#list + 1] = { event = event, count = count } end
+	table.sort(list, function(a, b) return a.count > b.count end)
+	local out = {}
+	for i = 1, math.min(n, #list) do
+		out[i] = list[i].count > 1 and (list[i].event .. " x" .. list[i].count) or list[i].event
+	end
+	return out
+end
+
+local function PrintLoadRun(run)
+	local total = 0
+	for _, f in ipairs(run.frames) do total = total + f.ms end
+	print(string.format("|cff55ff55CPUSnapshot load:|r %s, %s after loading screen at %s: %d frames of %dms+, %.0fms in all.",
+		run.addon, LOAD_WINDOW .. "s", run.when, #run.frames, LOAD_HEAVY_MS, total))
+	local sorted = {}
+	for i, f in ipairs(run.frames) do sorted[i] = f end
+	table.sort(sorted, function(a, b) return a.ms > b.ms end)
+	for i = 1, math.min(5, #sorted) do
+		local f = sorted[i]
+		print(string.format("  +%.2fs  %dms (frame %dms)", f.t, f.ms, f.frameMs))
+		if #f.timers == 0 then
+			print("     no timer of this addon was due: an event handler or OnUpdate")
+		end
+		for _, timer in ipairs(f.timers) do
+			print(string.format("     timer %s%.1fs: %s", timer.ticker and "ticker " or "", timer.delay, timer.where))
+		end
+		if #f.events > 0 then
+			print("     events: " .. table.concat(f.events, ", "))
+		end
+	end
+end
+
+local function FinishLoadRun(watcher)
+	local run = loadRun
+	loadRun = nil
+	watcher:UnregisterAllEvents()
+	watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+	CPUSnapshotDB.loadRuns = CPUSnapshotDB.loadRuns or {}
+	local runs = CPUSnapshotDB.loadRuns
+	runs[#runs + 1] = run
+	while #runs > MAX_LOAD_RUNS do table.remove(runs, 1) end
+	PrintLoadRun(run)
+end
+
+local function StartLoadTracer(target)
+	loadTarget = target
+	hooksecurefunc(C_Timer, "After", OnTimerScheduled(false))
+	hooksecurefunc(C_Timer, "NewTimer", OnTimerScheduled(false))
+	hooksecurefunc(C_Timer, "NewTicker", OnTimerScheduled(true))
+
+	local watcher = CreateFrame("Frame")
+	watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+	watcher:SetScript("OnEvent", function(self, event)
+		if event == "PLAYER_ENTERING_WORLD" and not loadRun then
+			loadRun = { addon = target, when = date("%H:%M:%S"), pew = GetTime(), frames = {} }
+			wipe(loadEvents)
+			wipe(loadPrevEvents)
+			-- Only during the window: the event names say which handlers ran in a heavy frame.
+			self:RegisterAllEvents()
+		end
+		if loadRun then loadEvents[event] = (loadEvents[event] or 0) + 1 end
+	end)
+	watcher:SetScript("OnUpdate", function(self)
+		local now = GetTime()
+		local run = loadRun
+		if run then
+			local ok, ms = pcall(C_AddOnProfiler.GetAddOnMetric, target, METRIC_LAST)
+			if ok and type(ms) == "number" and ms >= LOAD_HEAVY_MS then
+				-- LastTime may describe this frame or the one before, so take both frames' timers and events.
+				local timers = {}
+				for _, timer in ipairs(loadTimers) do
+					local fired = timer.due
+					-- A ticker's latest run at or before now. Cancelled tickers still match; the
+					-- hook can't see Cancel(), so treat a ticker line as a lead, not proof.
+					if timer.ticker and timer.delay > 0 and fired <= now + 0.01 then
+						fired = fired + math.floor((now + 0.01 - fired) / timer.delay) * timer.delay
+					end
+					-- Ticker runs land on frame boundaries and drift late, so allow some slack before.
+					local slack = timer.ticker and 0.05 or 0.01
+					if fired > loadPrevPrevTime - slack and fired <= now + 0.01 then
+						timers[#timers + 1] = { delay = timer.delay, where = timer.where, ticker = timer.ticker or nil }
+					end
+				end
+				local counts = {}
+				for e, c in pairs(loadPrevEvents) do counts[e] = c end
+				for e, c in pairs(loadEvents) do counts[e] = (counts[e] or 0) + c end
+				run.frames[#run.frames + 1] = {
+					t = now - run.pew,
+					ms = math.floor(ms + 0.5),
+					frameMs = math.floor((now - loadPrevTime) * 1000 + 0.5),
+					timers = timers,
+					events = TopEvents(counts, 6),
+				}
+			end
+			loadPrevEvents, loadEvents = loadEvents, loadPrevEvents
+			wipe(loadEvents)
+			if now - run.pew > LOAD_WINDOW then FinishLoadRun(self) end
+		end
+		loadPrevPrevTime, loadPrevTime = loadPrevTime, now
+	end)
+	print(string.format("|cff55ff55CPUSnapshot:|r tracing %s for %ds after each loading screen this session.", target, LOAD_WINDOW))
+end
+
+local loader = CreateFrame("Frame")
+loader:RegisterEvent("ADDON_LOADED")
+loader:SetScript("OnEvent", function(self, _, name)
+	if name ~= "CPUSnapshot" then return end
+	self:UnregisterEvent("ADDON_LOADED")
+	local target = CPUSnapshotDB and CPUSnapshotDB.armLoad
+	if target then
+		CPUSnapshotDB.armLoad = nil -- one session only
+		StartLoadTracer(target)
+	end
+end)
+
+SLASH_CPUSNAPLOAD1 = "/cpuload"
+SlashCmdList["CPUSNAPLOAD"] = function(msg)
+	msg = strtrim(msg or "")
+	CPUSnapshotDB = CPUSnapshotDB or {}
+	if msg:lower() == "off" then
+		CPUSnapshotDB.armLoad = nil
+		print("|cff55ff55CPUSnapshot:|r load tracer disarmed.")
+		return
+	elseif msg:lower() == "show" then
+		local runs = CPUSnapshotDB.loadRuns or {}
+		if #runs == 0 then print("|cff55ff55CPUSnapshot:|r no load runs saved.") end
+		for _, run in ipairs(runs) do PrintLoadRun(run) end
+		return
+	end
+	local target = msg ~= "" and msg or "!WilduTools"
+	if not C_AddOns.IsAddOnLoaded(target) then
+		print("|cffff5555CPUSnapshot:|r no loaded addon called " .. target .. " (use the folder name).")
+		return
+	end
+	CPUSnapshotDB.armLoad = target
+	print("|cff55ff55CPUSnapshot:|r load tracer armed for " .. target .. ". /reload now; it reports " .. LOAD_WINDOW .. "s after each loading screen.")
+end
+
+SLASH_CPUSNAPREC1 = "/cpurec"
+SlashCmdList["CPUSNAPREC"] = function(msg)
+	msg = (msg or ""):lower()
+	if msg == "clear" then
+		if CPUSnapshotDB then CPUSnapshotDB.hitches = {} end
+		print("|cff55ff55CPUSnapshot:|r hitch log cleared.")
+		return
+	elseif msg == "off" or msg == "on" then
+		recording = msg == "on"
+		print("|cff55ff55CPUSnapshot:|r hitch recording " .. msg .. ".")
+		return
+	end
+	local log = CPUSnapshotDB and CPUSnapshotDB.hitches or {}
+	print(string.format("|cff55ff55CPUSnapshot:|r %d hitches (>%dms) logged%s. Last 10:", #log, HITCH_MS, recording and "" or " (paused)"))
+	for i = math.max(1, #log - 9), #log do
+		local e = log[i]
+		local first = e.top[1]
+		print(string.format("  %s  %dms  top=%s  bags=%s  tip=%s", e.when:sub(12), e.ms,
+			first and first.name or "-", e.bags and "y" or "n", e.tooltip and (e.tooltip.item or e.tooltip.owner or "?") or "-"))
+	end
 end
